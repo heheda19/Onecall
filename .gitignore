@@ -1,0 +1,7 @@
+uploads/
+
+# IDE 配置文件（IDEA 自动生成，无需提交）
+.idea/
+*.iml
+*.iws
+*.ipr
