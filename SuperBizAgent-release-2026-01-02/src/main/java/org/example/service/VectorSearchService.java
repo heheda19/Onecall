@@ -53,7 +53,7 @@ public class VectorSearchService {
                     .withVectorFieldName("vector")
                     .withVectors(Collections.singletonList(queryVector))
                     .withTopK(topK)
-                    .withMetricType(io.milvus.param.MetricType.L2)
+                    .withMetricType(io.milvus.param.MetricType.COSINE)
                     .withOutFields(List.of("id", "content", "metadata"))
                     .withParams("{\"nprobe\":10}")
                     .build();

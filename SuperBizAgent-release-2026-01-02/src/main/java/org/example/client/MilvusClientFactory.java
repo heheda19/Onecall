@@ -164,7 +164,7 @@ public class MilvusClientFactory {
                 .withCollectionName(MilvusConstants.MILVUS_COLLECTION_NAME)
                 .withFieldName("vector")
                 .withIndexType(IndexType.IVF_FLAT)
-                .withMetricType(MetricType.L2)  // L2 距离（欧氏距离）
+                .withMetricType(MetricType.COSINE)  // L2 距离（欧氏距离）
                 .withExtraParam("{\"nlist\":128}")
                 .withSyncMode(Boolean.FALSE)
                 .build();

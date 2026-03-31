@@ -185,7 +185,7 @@ public class ChatController {
                 // 用于累积完整答案
                 StringBuilder fullAnswerBuilder = new StringBuilder();
                 
-                // 使用 agent.stream() 进行流式对话
+                // 使用 agent.stream() 进行流式对话：
                 Flux<NodeOutput> stream = agent.stream(request.getQuestion());
                 
                 stream.subscribe(
