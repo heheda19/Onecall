@@ -70,9 +70,6 @@ application-*.yml
 server.log
 server.pid
 
-# 忽略整个资源文件夹
-src/main/resources/
-
 # 但不忽略 static 文件夹
 !src/main/resources/static/
 
