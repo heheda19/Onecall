@@ -103,6 +103,53 @@ public class RagService {
         }
     }
 
+    // ============================================
+    // 扩展: 意图路由 + KB 分区 - RagService分区透传 (2026-05-30)
+    // queryStream 新增 kbId 和 partition 参数
+    // ============================================
+    /**
+     * 流式处理用户问题（带历史消息 + 知识库分区指定）
+     *
+     * @param question 用户问题
+     * @param history 历史消息列表，格式：[{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+     * @param kbId 知识库ID
+     * @param partition 分区名称，为null或空时全量检索
+     * @param callback 流式回调接口
+     */
+    public void queryStream(String question, List<Map<String, String>> history, String kbId,
+                            String partition, StreamCallback callback) {
+        try {
+            logger.info("收到 RAG 流式查询: question={}, kbId={}, partition={}", question, kbId, partition);
+
+            // 1. 从向量数据库检索相关文档（带分区过滤）
+            List<VectorSearchService.SearchResult> searchResults =
+                vectorSearchService.searchSimilarDocuments(question, topK, partition);
+
+            // 发送检索结果
+            callback.onSearchResults(searchResults);
+
+            if (searchResults.isEmpty()) {
+                logger.warn("未找到相关文档, kbId={}, partition={}", kbId, partition);
+                String partitionHint = (partition != null && !partition.isEmpty())
+                    ? String.format("抱歉，在知识库 %s 的分区【%s】中没有找到相关信息来回答您的问题。", kbId, partition)
+                    : String.format("抱歉，在知识库 %s 中没有找到相关信息来回答您的问题。", kbId);
+                callback.onComplete(partitionHint, "");
+                return;
+            }
+
+            // 2. 构建上下文和提示词
+            String context = buildContext(searchResults);
+            String prompt = buildPrompt(question, context);
+
+            // 3. 流式调用大语言模型（传入历史消息）
+            generateAnswerStream(prompt, history, callback);
+
+        } catch (Exception e) {
+            logger.error("RAG 流式查询失败, kbId={}, partition={}", kbId, partition, e);
+            callback.onError(e);
+        }
+    }
+
     /**
      * 构建上下文
      */

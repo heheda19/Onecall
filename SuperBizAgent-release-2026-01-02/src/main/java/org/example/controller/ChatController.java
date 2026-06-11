@@ -95,7 +95,7 @@ public class ChatController {
             ReactAgent agent = chatService.createReactAgent(chatModel, systemPrompt);
             
             // 执行对话
-            String fullAnswer = chatService.executeChat(agent, request.getQuestion());
+            String fullAnswer = chatService.executeChat(agent, request.getQuestion(), history);
             
             // 更新会话历史
             session.addMessage(request.getQuestion(), fullAnswer);

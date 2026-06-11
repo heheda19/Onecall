@@ -9,6 +9,7 @@ import io.milvus.param.dml.DeleteParam;
 import io.milvus.param.dml.InsertParam;
 import lombok.Getter;
 import lombok.Setter;
+import org.example.config.IntentNodesConfig;
 import org.example.constant.MilvusConstants;
 import org.example.dto.DocumentChunk;
 import org.slf4j.Logger;
@@ -41,6 +42,17 @@ public class VectorIndexService {
 
     @Autowired
     private DocumentChunkService chunkService;
+
+    @Autowired(required = false)
+    private KeywordSearchService keywordSearchService;
+
+    // ============================================
+    // 扩展: 意图路由 + KB 分区 - 上传自动归类 (2026-05-30)
+    // 文件上传时根据文件名关键词匹配 partition，
+    // 如 "cpu_high_usage.md" → partition_cpu
+    // ============================================
+    @Autowired
+    private IntentNodesConfig intentNodesConfig;
 
     @Value("${file.upload.path}")
     private String uploadPath;
@@ -142,10 +154,12 @@ public class VectorIndexService {
         List<DocumentChunk> chunks = chunkService.chunkDocument(content, path.toString());
         logger.info("文档分片完成: {} -> {} 个分片", filePath, chunks.size());
 
-        // 4. 为每个分片生成向量并插入 Milvus
+        // 4. 为每个分片生成向量并插入 Milvus + 同步 BM25 索引
+        String normalizedSource = path.toString().replace(File.separator, "/");
+
         for (int i = 0; i < chunks.size(); i++) {
             DocumentChunk chunk = chunks.get(i);
-            
+
             try {
                 // 生成向量
                 List<Float> vector = embeddingService.generateEmbedding(chunk.getContent());
@@ -153,9 +167,24 @@ public class VectorIndexService {
                 // 构建元数据（包含文件信息）
                 Map<String, Object> metadata = buildMetadata(path.toString(), chunk, chunks.size());
 
+                // 生成文档 ID（与 Milvus 中保持一致，便于 RRF 融合去重）
+                String chunkId = UUID.nameUUIDFromBytes(
+                        (normalizedSource + "_" + chunk.getChunkIndex()).getBytes()
+                ).toString();
+
                 // 插入到 Milvus
                 insertToMilvus(chunk.getContent(), vector, metadata, chunk.getChunkIndex());
-                
+
+                // 同步到 BM25 关键词索引
+                if (keywordSearchService != null) {
+                    try {
+                        keywordSearchService.addDocument(chunkId, chunk.getContent(), normalizedSource);
+                        logger.info("BM25 索引已同步: chunkId={}", chunkId);
+                    } catch (Exception e) {
+                        logger.warn("BM25 索引同步失败（不影响向量索引）: {}", e.getMessage());
+                    }
+                }
+
                 logger.info("✓ 分片 {}/{} 索引成功", i + 1, chunks.size());
 
             } catch (Exception e) {
@@ -171,6 +200,18 @@ public class VectorIndexService {
      * 删除文件的旧数据（根据 metadata._source）
      */
     private void deleteExistingData(String filePath) {
+        // 同步移除 BM25 索引
+        if (keywordSearchService != null) {
+            try {
+                Path bm25Path = Paths.get(filePath).normalize();
+                String normalizedSource = bm25Path.toString().replace(File.separator, "/");
+                keywordSearchService.removeBySource(normalizedSource);
+                logger.debug("BM25 索引已移除来源: {}", normalizedSource);
+            } catch (Exception e) {
+                logger.warn("移除 BM25 索引失败: {}", e.getMessage());
+            }
+        }
+
         try {
             // 使用统一的路径分隔符（正斜杠）用于Milvus存储，避免表达式解析错误
             // 将系统路径转换为统一格式
@@ -268,6 +309,11 @@ public class VectorIndexService {
 
             // 生成唯一 ID（使用 _source + 分片索引）
             String source = (String) metadata.get("_source");
+            String fileName = (String) metadata.get("_file_name");
+            // ── 新增: 根据文件名推断 partition ──
+            String partition = intentNodesConfig.resolvePartitionByFilename(fileName);
+            metadata.put("_partition", partition);
+            logger.debug("==> [分区归类] 文件={} → partition={}", fileName, partition);
             String id = UUID.nameUUIDFromBytes((source + "_" + chunkIndex).getBytes()).toString();
 
             // 构建字段数据
@@ -290,6 +336,7 @@ public class VectorIndexService {
             // 构建插入参数
             InsertParam insertParam = InsertParam.newBuilder()
                     .withCollectionName(MilvusConstants.MILVUS_COLLECTION_NAME)
+                    .withPartitionName(partition)
                     .withFields(fields)
                     .build();
 
@@ -300,7 +347,7 @@ public class VectorIndexService {
                 throw new RuntimeException("插入向量失败: " + insertResponse.getMessage());
             }
 
-            logger.debug("向量插入成功: id={}, source={}, chunk={}", id, source, chunkIndex);
+            logger.debug("向量插入成功: id={}, source={}, partition={}, chunk={}", id, source, partition, chunkIndex);
 
         } catch (Exception e) {
             logger.error("插入向量到 Milvus 失败", e);

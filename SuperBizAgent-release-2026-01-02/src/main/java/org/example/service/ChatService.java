@@ -9,14 +9,18 @@ import org.example.agent.tool.DateTimeTools;
 import org.example.agent.tool.InternalDocsTools;
 import org.example.agent.tool.QueryLogsTools;
 import org.example.agent.tool.QueryMetricsTools;
+import org.example.service.VectorSearchService.SearchResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.support.ToolCallbacks;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
@@ -38,11 +42,26 @@ public class ChatService {
     @Autowired
     private QueryMetricsTools queryMetricsTools;
 
-    @Autowired(required = false)  // Mock 模式下才注册，所以设置为 optional,真实环境通过mcp配置注入
+    @Autowired(required = false)
     private QueryLogsTools queryLogsTools;
 
     @Autowired
     private ToolCallbackProvider tools;
+
+    // ============================================
+    // 扩展: 意图路由 + KB 分区 - FastRAG预检索模式 (2026-06-04)
+    // 对标 FastRAG: 分类 -> 预检索 -> 注入文档 -> Agent 推理
+    // 非知识库意图(confidence=none)直接跳过RAG, 避免浪费 LLM 调用
+    // ============================================
+
+    @Autowired
+    private IntentClassifierService intentClassifier;
+
+    @Autowired
+    private KnowledgeAgentService knowledgeAgentService;
+
+    @Autowired
+    private QueryRewriteService queryRewriteService;
 
     @Value("${spring.ai.dashscope.api-key}")
     private String dashScopeApiKey;
@@ -58,9 +77,6 @@ public class ChatService {
 
     /**
      * 创建 ChatModel
-     * @param temperature 控制随机性 (0.0-1.0)
-     * @param maxToken 最大输出长度
-     * @param topP 核采样参数
      */
     public DashScopeChatModel createChatModel(DashScopeApi dashScopeApi, double temperature, int maxToken, double topP) {
         return DashScopeChatModel.builder()
@@ -75,7 +91,7 @@ public class ChatService {
     }
 
     /**
-     * 创建标准对话 ChatModel（默认参数）
+     * 创建标准对话 ChatModel
      */
     public DashScopeChatModel createStandardChatModel(DashScopeApi dashScopeApi) {
         return createChatModel(dashScopeApi, 0.7, 2000, 0.9);
@@ -83,43 +99,31 @@ public class ChatService {
 
     /**
      * 构建系统提示词（包含历史消息）
-     * @param history 历史消息列表
-     * @return 完整的系统提示词
+     * 2026-06-04 FastRAG预检索模式: 文档由应用层预检索并注入用户消息，
+     * Agent 只需阅读文档 + 调用监控/日志工具，不再负责搜索知识库。
      */
     public String buildSystemPrompt(List<Map<String, String>> history) {
         StringBuilder promptBuilder = new StringBuilder();
 
-        // 1. 角色设定 (Persona)
         promptBuilder.append("### 角色设定\n");
         promptBuilder.append("你是一个高级智能助手，具备强大的逻辑推理能力和工具调用能力，能够综合分析多方数据源来解决用户问题。\n\n");
 
-        // 2. 核心能力与工具调用指南 (Tool Guidelines)
-        promptBuilder.append("### 工具使用指南\n");
-        promptBuilder.append("你可以通过调用外部工具来获取实时数据或专有信息。请严格评估用户的意图，并遵循以下触发条件：\n");
+        promptBuilder.append("### 工作方式\n");
+        promptBuilder.append("用户消息中可能已包含预先检索到的知识库文档。");
+        promptBuilder.append("如果存在，请优先基于这些文档回答问题。如果不存在或不足以覆盖用户问题，请调用工具补充。\n\n");
 
-        // 【核心优化】拓宽知识库的触发边界，明确告知模型这里包含了用户的上传文件
-        promptBuilder.append("你拥有三个操作知识库的专属工具，请严格按照以下边界条件选择调用：\n");
+        promptBuilder.append("- 清点文件资产 (listUploadedFiles): 当用户询问有哪些文件、列出所有文档时调用。\n");
+        promptBuilder.append("- 精确读取文件 (readSpecificFile): 当用户明确要求读取某个具体文件时调用。\n");
+        promptBuilder.append("- 查询具体知识 (queryInternalDocs): 当预检索文档不足时作为补充搜索。\n");
+        promptBuilder.append("- 时间查询 (getCurrentDateTime): 需要当前准确时间时调用。\n");
+        promptBuilder.append("- 监控告警 (queryPrometheusAlerts): 排查系统故障时调用。\n");
+        promptBuilder.append("- 云端日志 (腾讯云MCP服务): 排查报错、追踪请求时调用。\n\n");
 
-        // 1. 查目录（宏观视角）
-        promptBuilder.append("- **清点文件资产 (listUploadedFiles)**：当用户询问“知识库里有什么文件”、“列出所有文档”、“我刚才传了什么”时，必须且只能调用此工具，获取当前磁盘上的真实文件列表。\n");
-
-        // 2. 读全文（微观/精确视角）-> 这是为你新加的工具准备的
-        promptBuilder.append("- **精确读取文件 (readSpecificFile)**：当用户明确说出了具体的【文件名】（含后缀），并要求“读取”、“查看原文”、“输出全文”或“总结这个文件”时（例如：“读取 命令.txt”、“把 slow_response.md 发给我”），**必须**调用此工具获取原始全文。严禁使用 queryInternalDocs 去模糊检索具体文件。\n");
-
-        // 3. 查知识（语义/模糊视角）
-        promptBuilder.append("- **查询具体知识 (queryInternalDocs)**：当用户提出具体的业务问题、排查报错、询问流程，且**没有**指名道姓要求读取某个特定文件时（例如：“怎么排查磁盘高占用？”、“系统 OOM 怎么办？”），调用此工具在多文档中进行语义检索。\n");
-
-        promptBuilder.append("- **时间查询 (getCurrentDateTime)**：当需要知道当前准确的日期、时间或处理相对时间（如“今天”、“刚才”）时调用。\n");
-        promptBuilder.append("- **监控告警 (queryPrometheusAlerts)**：当排查系统故障、询问应用健康状况或 Prometheus 告警状态时调用。\n");
-        promptBuilder.append("- **云端日志 (腾讯云MCP服务)**：当排查具体报错、追踪请求或查询腾讯云 CLS 日志时调用（默认地域: ap-guangzhou，默认时间范围: 近一个月）。\n\n");
-
-        // 3. 行为与输出约束 (Constraints)
         promptBuilder.append("### 回答约束\n");
-        promptBuilder.append("1. **基于事实**：回答必须以工具检索到的内容为准。如果检索结果包含多个文件片段，请进行归纳提炼。\n");
-        promptBuilder.append("2. **拒绝幻觉**：如果调用工具后未返回有效结果，请诚实告知用户“在知识库/系统中未找到相关记录”，严禁编造虚假的文件名或数据。\n");
-        promptBuilder.append("3. **逻辑清晰**：请使用 Markdown 格式（如加粗、列表、代码块）来排版你的回答，使其清晰易读。\n\n");
+        promptBuilder.append("1. 基于事实: 优先使用预检索文档中的内容。\n");
+        promptBuilder.append("2. 拒绝幻觉: 未找到有效信息时诚实告知，严禁编造。\n");
+        promptBuilder.append("3. 逻辑清晰: 使用 Markdown 格式排版回答。\n\n");
 
-        // 4. 对话历史 (History Integration)
         if (history != null && !history.isEmpty()) {
             promptBuilder.append("### 历史上下文\n");
             for (Map<String, String> msg : history) {
@@ -137,28 +141,19 @@ public class ChatService {
 
     /**
      * 动态构建方法工具数组
-     * 根据 cls.mock-enabled 决定是否包含 QueryLogsTools
      */
     public Object[] buildMethodToolsArray() {
         if (queryLogsTools != null) {
-            // Mock 模式：包含 QueryLogsTools
             return new Object[]{dateTimeTools, internalDocsTools, queryMetricsTools, queryLogsTools};
         } else {
-            // 真实模式：不包含 QueryLogsTools（由 MCP 提供日志查询功能）
             return new Object[]{dateTimeTools, internalDocsTools, queryMetricsTools};
         }
     }
 
-    /**
-     * 获取工具回调列表，mcp服务提供的工具
-     */
     public ToolCallback[] getToolCallbacks() {
         return tools.getToolCallbacks();
     }
 
-    /**
-     * 记录可用工具列表：mcp服务提供的工具
-     */
     public void logAvailableTools() {
         ToolCallback[] toolCallbacks = tools.getToolCallbacks();
         logger.info("可用工具列表:");
@@ -167,31 +162,83 @@ public class ChatService {
         }
     }
 
-    /**
-     * 创建 ReactAgent
-     * @param chatModel 聊天模型
-     * @param systemPrompt 系统提示词
-     * @return 配置好的 ReactAgent
-     */
     public ReactAgent createReactAgent(DashScopeChatModel chatModel, String systemPrompt) {
+        List<ToolCallback> mergedTools = new ArrayList<>();
+        if (getToolCallbacks() != null) {
+            mergedTools.addAll(Arrays.asList(getToolCallbacks()));
+        }
+        for (Object toolObj : buildMethodToolsArray()) {
+            mergedTools.addAll(Arrays.asList(ToolCallbacks.from(toolObj)));
+        }
+
         return ReactAgent.builder()
                 .name("intelligent_assistant")
                 .model(chatModel)
                 .systemPrompt(systemPrompt)
-                .methodTools(buildMethodToolsArray())
-                .tools(getToolCallbacks())
+                .tools(mergedTools.toArray(new ToolCallback[0]))
                 .build();
     }
 
+    // ============================================
+    // FastRAG 预检索模式 (2026-06-04)
+    // 1. LLM 意图分类 -> 确定分区 (confidence=none 则跳过RAG)
+    // 2. 应用层调 RAG Pipeline (Query Rewrite -> 双路召回 -> RRF -> Rerank)
+    // 3. 检索结果注入用户消息，Agent 只负责阅读+推理+调监控/日志工具
+    // ============================================
     /**
      * 执行 ReactAgent 对话（非流式）
-     * @param agent ReactAgent 实例
-     * @param question 用户问题
-     * @return AI 回复
+     * Pipeline (2026-06-08): 查询改写 -> 意图分类 -> 预检索 -> 注入 -> Agent
      */
-    public String executeChat(ReactAgent agent, String question) throws GraphRunnerException {
-        logger.info("执行 ReactAgent.call() - 自动处理工具调用");
-        var response = agent.call(question);
+    public String executeChat(ReactAgent agent, String question,
+                              List<Map<String, String>> history) throws GraphRunnerException {
+        // Step 1: 查询改写 (指代消解 + 上下文补全 + 口语转正式 + 关键词扩展)
+        String rewritten = queryRewriteService.rewrite(question, history);
+
+        // Step 2: 意图分类 (基于改写后的精准 query)
+        IntentClassifierService.ClassificationResult classification =
+            intentClassifier.classify(rewritten);
+
+        if (classification.needsGuidance()) {
+            logger.info("[RAG] 意图不明确，返回引导消息");
+            return classification.guidanceMessage();
+        }
+
+        // 2026-06-04: 非知识库意图跳过RAG, 对标FastRAG
+        // "现在几点了"、"你好" 这类不需要检索的查询直达Agent
+        String enrichedQuestion;
+        if ("none".equals(classification.confidence())) {
+            logger.info("[RAG] 非KB意图(confidence=none)，跳过RAG，直达Agent");
+            enrichedQuestion = rewritten;
+        } else {
+            logger.info("[RAG] 路由分区 -> {} | 预检索模式", classification.partition());
+
+            try {
+                List<SearchResult> docs =
+                    knowledgeAgentService.intelligentSearch(rewritten, classification.partition());
+
+                if (!docs.isEmpty()) {
+                    logger.info("[RAG] 预检索完成 | 命中 {} 条文档 -> 注入Agent上下文", docs.size());
+                    StringBuilder docBlock = new StringBuilder();
+                    docBlock.append("### 已检索到的相关知识库文档 (分区: ")
+                            .append(classification.partition()).append(")\n\n");
+                    for (int i = 0; i < docs.size(); i++) {
+                        docBlock.append("---\n**文档").append(i + 1).append("**:\n")
+                                .append(docs.get(i).getContent()).append("\n\n");
+                    }
+                    docBlock.append("---\n**用户问题**: ").append(question);
+                    enrichedQuestion = docBlock.toString();
+                } else {
+                    logger.info("[RAG] 预检索无结果，Agent自行补充搜索");
+                    enrichedQuestion = question;
+                }
+            } catch (Exception e) {
+                logger.warn("[RAG] 预检索异常，降级为纯Agent模式: {}", e.getMessage());
+                enrichedQuestion = question;
+            }
+        }
+
+        logger.info("执行 ReactAgent.call()");
+        var response = agent.call(enrichedQuestion);
         String answer = response.getText();
         logger.info("ReactAgent 对话完成，答案长度: {}", answer.length());
         return answer;

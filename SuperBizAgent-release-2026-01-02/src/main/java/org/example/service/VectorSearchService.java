@@ -33,30 +33,60 @@ public class VectorSearchService {
     private VectorEmbeddingService embeddingService;
 
     /**
-     * 搜索相似文档
-     * 
+     * 搜索相似文档（全量检索，不指定分区）
+     *
      * @param query 查询文本
      * @param topK 返回最相似的K个结果
      * @return 搜索结果列表
      */
     public List<SearchResult> searchSimilarDocuments(String query, int topK) {
+        return searchSimilarDocuments(query, topK, null);
+    }
+
+    // ============================================
+    // 扩展: 意图路由 + KB 分区 - Milvus Partition检索 (2026-05-30)
+    // 新增 partition 参数，使用 Milvus withPartitionNames() 剪枝搜索范围
+    // ============================================
+    /**
+     * 搜索相似文档（支持分区检索）
+     *
+     * @param query 查询文本
+     * @param topK 返回最相似的K个结果
+     * @param partition 分区名称，为null或空时全量检索
+     * @return 搜索结果列表
+     */
+    public List<SearchResult> searchSimilarDocuments(String query, int topK, String partition) {
         try {
-            logger.info("开始搜索相似文档, 查询: {}, topK: {}", query, topK);
+            // ── 新增: Partition 过滤 ──
+            if (partition != null && !partition.isEmpty()) {
+                logger.info("[RAG] ① 查询向量化 | query={} | top_k={} | partition={}", query, topK, partition);
+            } else {
+                logger.info("[RAG] ① 全量检索(未指定分区) | query={} | top_k={}", query, topK);
+            }
 
             // 1. 将查询文本向量化
             List<Float> queryVector = embeddingService.generateQueryVector(query);
             logger.debug("查询向量生成成功, 维度: {}", queryVector.size());
 
             // 2. 构建搜索参数
-            SearchParam searchParam = SearchParam.newBuilder()
+            SearchParam.Builder searchBuilder = SearchParam.newBuilder()
                     .withCollectionName(MilvusConstants.MILVUS_COLLECTION_NAME)
                     .withVectorFieldName("vector")
                     .withVectors(Collections.singletonList(queryVector))
                     .withTopK(topK)
                     .withMetricType(io.milvus.param.MetricType.COSINE)
                     .withOutFields(List.of("id", "content", "metadata"))
-                    .withParams("{\"nprobe\":10}")
-                    .build();
+                    .withParams("{\"nprobe\":10}");
+
+            // ── 新增: Partition 过滤 ──
+            if (partition != null && !partition.isEmpty()) {
+                searchBuilder.withPartitionNames(Collections.singletonList(partition));
+                logger.info("[RAG] ③ 分区检索 | partition={} | top_k={}", partition, topK);
+            } else {
+                logger.info("[RAG] ③ 全量检索(未指定分区) | top_k={}", topK);
+            }
+
+            SearchParam searchParam = searchBuilder.build();
 
             // 3. 执行搜索
             R<SearchResults> searchResponse = milvusClient.search(searchParam);
@@ -74,17 +104,17 @@ public class VectorSearchService {
                 result.setId((String) wrapper.getIDScore(0).get(i).get("id"));
                 result.setContent((String) wrapper.getFieldData("content", 0).get(i));
                 result.setScore(wrapper.getIDScore(0).get(i).getScore());
-                
+
                 // 解析 metadata
                 Object metadataObj = wrapper.getFieldData("metadata", 0).get(i);
                 if (metadataObj != null) {
                     result.setMetadata(metadataObj.toString());
                 }
-                
+
                 results.add(result);
             }
 
-            logger.info("搜索完成, 找到 {} 个相似文档", results.size());
+            logger.info("[RAG] ④ 搜索完成 | 命中数={}", results.size());
             return results;
 
         } catch (Exception e) {

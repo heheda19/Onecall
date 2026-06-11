@@ -1,5 +1,8 @@
 package org.example.service;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+
 import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatModel;
 import com.alibaba.cloud.ai.graph.OverAllState;
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
@@ -12,6 +15,7 @@ import org.example.agent.tool.QueryMetricsTools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.support.ToolCallbacks;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -94,6 +98,19 @@ public class AiOpsService {
         }
     }
 
+    private ToolCallback[] mergeTools(ToolCallback[] mcpTools) {
+        List<ToolCallback> merged = new ArrayList<>();
+        // 1. 加入 MCP 工具
+        if (mcpTools != null) {
+            merged.addAll(Arrays.asList(mcpTools));
+        }
+        // 2. 加入本地方法工具
+        for (Object toolObj : buildMethodToolsArray()) {
+            merged.addAll(Arrays.asList(ToolCallbacks.from(toolObj)));
+        }
+        return merged.toArray(new ToolCallback[0]);
+    }
+
     /**
      * 构建 Planner Agent
      */
@@ -103,8 +120,8 @@ public class AiOpsService {
                 .description("负责拆解告警、规划与再规划步骤")
                 .model(chatModel)
                 .systemPrompt(buildPlannerPrompt())
-                .methodTools(buildMethodToolsArray())
-                .tools(toolCallbacks)
+                // 替换掉原来的 methodTools 和 tools：
+                .tools(mergeTools(toolCallbacks))
                 .outputKey("planner_plan")
                 .build();
     }
@@ -118,11 +135,41 @@ public class AiOpsService {
                 .description("负责执行 Planner 的首个步骤并及时反馈")
                 .model(chatModel)
                 .systemPrompt(buildExecutorPrompt())
-                .methodTools(buildMethodToolsArray())
-                .tools(toolCallbacks)
+                // 替换掉原来的 methodTools 和 tools：
+                .tools(mergeTools(toolCallbacks))
                 .outputKey("executor_feedback")
                 .build();
     }
+
+    /**
+     * 构建 Planner Agent
+     */
+//    private ReactAgent buildPlannerAgent(DashScopeChatModel chatModel, ToolCallback[] toolCallbacks) {
+//        return ReactAgent.builder()
+//                .name("planner_agent")
+//                .description("负责拆解告警、规划与再规划步骤")
+//                .model(chatModel)
+//                .systemPrompt(buildPlannerPrompt())
+//                .methodTools(buildMethodToolsArray())
+//                .tools(toolCallbacks)
+//                .outputKey("planner_plan")
+//                .build();
+//    }
+
+    /**
+     * 构建 Executor Agent
+     */
+//    private ReactAgent buildExecutorAgent(DashScopeChatModel chatModel, ToolCallback[] toolCallbacks) {
+//        return ReactAgent.builder()
+//                .name("executor_agent")
+//                .description("负责执行 Planner 的首个步骤并及时反馈")
+//                .model(chatModel)
+//                .systemPrompt(buildExecutorPrompt())
+//                .methodTools(buildMethodToolsArray())
+//                .tools(toolCallbacks)
+//                .outputKey("executor_feedback")
+//                .build();
+//    }
 
     /**
      * 动态构建方法工具数组
@@ -147,7 +194,7 @@ public class AiOpsService {
                 1. 读取当前输入任务 {input} 以及 Executor 的最近反馈 {executor_feedback}。
                 2. 分析 Prometheus 告警、日志、内部文档等信息，制定可执行的下一步步骤。
                 3. 在执行阶段，输出 JSON，包含 decision (PLAN|EXECUTE|FINISH)、step 描述、预期要调用的工具、以及必要的上下文。
-                4. 调用任何腾讯云日志/主题相关工具时，region 参数必须使用连字符格式（如 ap-guangzhou），若不确定请省略以使用默认值。
+                4. 调用任何腾讯云日志/主题相关工具时，region 参数必须严格使用连字符格式（如 ap-guangzhou）。【严重警告】绝不能传入中文或空字符串 \\"\\"！如果你不知道具体的连字符代码，或者正在调用 `GetRegionCodeByName` 工具，请务必强制传入 \\"ap-guangzhou\\" 作为默认 region。\\n
                 5. 严格禁止编造数据，只能引用工具返回的真实内容；如果连续 3 次调用同一工具仍失败或返回空结果，需停止该方向并在最终报告的结论部分说明"无法完成"的原因。
                 
                 ## 最终报告输出要求（CRITICAL）
@@ -241,7 +288,7 @@ public class AiOpsService {
     private String buildExecutorPrompt() {
         return """
                 你是 Executor Agent，负责读取 Planner 最新输出 {planner_plan}，只执行其中的第一步。
-                - 确认步骤所需的工具与参数，尤其是 region 参数要使用连字符格式（ap-guangzhou）；若 Planner 未给出则使用默认区域。
+                - 确认步骤所需的工具与参数，尤其是 region 参数必须严格使用连字符格式。严禁使用中文或空字符串 \\"\\"。若 Planner 未给出合法的连字符代号，或者你不确定，请在调用参数中强制填入 \\"ap-guangzhou\\" 作为默认值兜底。\\n
                 - 调用相应的工具并收集结果，如工具返回错误或空数据，需要将失败原因、请求参数一并记录，并停止进一步调用该工具（同一工具失败达到 3 次时应直接返回 FAILED）。
                 - 将日志、指标、文档等证据整理成结构化摘要，标注对应的告警名称或资源，方便 Planner 填充"告警根因分析 / 处理方案执行"章节。
                 - 以 JSON 形式返回执行状态、证据以及给 Planner 的建议，写入 executor_feedback，严禁编造未实际查询到的内容。
@@ -268,11 +315,12 @@ public class AiOpsService {
                 3. 根据 executor_agent 的反馈，评估是否需要再次调用 planner_agent，直到 decision=FINISH。
                 4. FINISH 后，确保向最终用户输出完整的《告警分析报告》，格式必须严格为：
                    告警分析报告\n---\n# 告警处理详情\n## 活跃告警清单\n## 告警根因分析N\n## 处理方案执行N\n## 结论。
-                5. 若步骤涉及腾讯云日志/主题工具，请确保使用连字符区域 ID（ap-guangzhou 等），或省略 region 以采用默认值。
+                5. 若步骤涉及腾讯云日志/主题工具，必须确保使用连字符区域 ID（如 ap-guangzhou）。绝对不能传入中文或空字符串。如果遇到缺失或不知晓 region 的情况，请强制使用 \\"ap-guangzhou\\" 传入。\\n
                 6. 如果发现 Planner/Executor 在同一方向连续 3 次调用工具仍失败或没有数据，必须终止流程，直接输出"任务无法完成"的报告，明确告知失败原因，严禁凭空编造结果。
 
                 只允许在 planner_agent、executor_agent 与 FINISH 之间做出选择。
 
                 """;
     }
+
 }
